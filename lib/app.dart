@@ -1,32 +1,21 @@
 import 'package:flutter/material.dart';
 
+import 'core/theme/hydrofix_theme.dart';
+import 'features/stitch_ui/hydrofix_stitch_screens.dart';
+
 class HydrofixApp extends StatelessWidget {
   const HydrofixApp({super.key});
 
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'Hydrofix',
+      title: 'HydroFix',
+
       debugShowCheckedModeBanner: false,
 
-      theme: ThemeData(
-        colorScheme: ColorScheme.fromSeed(
-          seedColor: const Color(0xFF087E8B),
-        ),
-        useMaterial3: true,
-      ),
+      theme: HydroTheme.light,
 
-      home: const Scaffold(
-        body: Center(
-          child: Text(
-            'Welcome to Hydrofix',
-            style: TextStyle(
-              fontSize: 24,
-              fontWeight: FontWeight.bold,
-            ),
-          ),
-        ),
-      ),
+      home: const HydroWelcome(),
     );
   }
 }

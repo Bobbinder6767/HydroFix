@@ -1,4 +1,8 @@
+import 'dart:convert';
+import 'dart:io';
+
 import 'package:flutter/material.dart';
+import 'package:image_picker/image_picker.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 import '../../core/theme/hydrofix_theme.dart';
 
@@ -20,21 +24,27 @@ class _HydroShellState extends State<HydroShell> {
     final pages = [
       CitizenHome(onReport: () => setState(() => selected = 1),
         onTrack: () => setState(() => selected = 2)),
-      const ReportScreen(),
+      ReportScreen(onSubmitted: () => setState(() => selected = 2)),
       const TrackScreen(),
       const ProfileScreen(),
     ];
-    return Scaffold(
-      body: IndexedStack(index: selected, children: pages),
-      bottomNavigationBar: NavigationBar(
-        selectedIndex: selected,
-        onDestinationSelected: (i) => setState(() => selected = i),
-        destinations: const [
-          NavigationDestination(icon: Icon(Icons.home_outlined), selectedIcon: Icon(Icons.home), label: 'Home'),
-          NavigationDestination(icon: Icon(Icons.add_circle_outline), label: 'Report'),
-          NavigationDestination(icon: Icon(Icons.fact_check_outlined), label: 'Track'),
-          NavigationDestination(icon: Icon(Icons.person_outline), label: 'Profile'),
-        ],
+    return PopScope(
+      canPop: selected == 0,
+      onPopInvokedWithResult: (didPop, _) {
+        if (!didPop && selected != 0) setState(() => selected = 0);
+      },
+      child: Scaffold(
+        body: IndexedStack(index: selected, children: pages),
+        bottomNavigationBar: NavigationBar(
+          selectedIndex: selected,
+          onDestinationSelected: (i) => setState(() => selected = i),
+          destinations: const [
+            NavigationDestination(icon: Icon(Icons.home_outlined), selectedIcon: Icon(Icons.home), label: 'Home'),
+            NavigationDestination(icon: Icon(Icons.add_circle_outline), label: 'Report'),
+            NavigationDestination(icon: Icon(Icons.fact_check_outlined), label: 'Track'),
+            NavigationDestination(icon: Icon(Icons.person_outline), label: 'Profile'),
+          ],
+        ),
       ),
     );
   }
@@ -414,7 +424,8 @@ class _Metric extends StatelessWidget {
 }
 
 class ReportScreen extends StatefulWidget {
-  const ReportScreen({super.key});
+  const ReportScreen({super.key, this.onSubmitted});
+  final VoidCallback? onSubmitted;
   @override
   State<ReportScreen> createState() => _ReportScreenState();
 }
@@ -424,8 +435,221 @@ class _ReportScreenState extends State<ReportScreen> {
   final description = TextEditingController();
   final form = GlobalKey<FormState>();
   String severity = 'green';
+  String category = 'water_leakage';
+  bool submitting = false;
+  final address = TextEditingController();
+  bool verifying = false;
+  XFile? selectedPhoto;
+  String? aiSuggested;
+  String? aiReason;
+  double? aiConfidence;
+
+  Future<void> selectPhoto() async {
+    final source = await showModalBottomSheet<ImageSource>(
+      context: context,
+      builder: (context) => SafeArea(
+        child: Column(mainAxisSize: MainAxisSize.min, children: [
+          ListTile(
+            leading: const Icon(Icons.camera_alt_outlined),
+            title: const Text('Take a photo'),
+            onTap: () => Navigator.pop(context, ImageSource.camera),
+          ),
+          ListTile(
+            leading: const Icon(Icons.photo_library_outlined),
+            title: const Text('Choose from gallery'),
+            onTap: () => Navigator.pop(context, ImageSource.gallery),
+          ),
+        ]),
+      ),
+    );
+    if (source == null) return;
+    try {
+      final photo = await ImagePicker().pickImage(
+        source: source,
+        maxWidth: 1280,
+        maxHeight: 1280,
+        imageQuality: 65,
+        requestFullMetadata: false,
+      );
+      if (!mounted || photo == null) return;
+      setState(() {
+        selectedPhoto = photo;
+        aiSuggested = null;
+        aiReason = null;
+        aiConfidence = null;
+      });
+    } catch (_) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+        content: Text('Could not access the camera or gallery.'),
+      ));
+    }
+  }
+
+  Future<void> verifySeverity() async {
+    if (verifying) return;
+    final text = description.text.trim();
+    if (text.length < 10) {
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+        content: Text('Describe the issue in at least 10 characters.'),
+      ));
+      return;
+    }
+    final client = Supabase.instance.client;
+    if (client.auth.currentSession == null) {
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+        content: Text('Please sign in before verifying severity.'),
+      ));
+      return;
+    }
+
+    setState(() => verifying = true);
+    try {
+      final body = <String, dynamic>{'description': text};
+      if (selectedPhoto != null) {
+        final bytes = await selectedPhoto!.readAsBytes();
+        if (bytes.length > 4 * 1024 * 1024) {
+          throw Exception('Photo is too large. Choose a smaller image.');
+        }
+        final extension = selectedPhoto!.path.toLowerCase();
+        final mime = extension.endsWith('.png')
+            ? 'image/png'
+            : extension.endsWith('.webp')
+                ? 'image/webp'
+                : 'image/jpeg';
+        body['imageBase64'] = base64Encode(bytes);
+        body['imageMimeType'] = mime;
+      }
+
+      final response = await client.functions.invoke(
+        'verify-severity',
+        body: body,
+      );
+      if (response.status != 200 || response.data is! Map) {
+        throw Exception('AI verification unavailable (${response.status}).');
+      }
+      final result = response.data as Map;
+      final recommendation = result['severity']?.toString().toLowerCase();
+      if (!['green', 'yellow', 'red'].contains(recommendation)) {
+        throw Exception(result['error'] ?? 'Invalid AI response.');
+      }
+      if (!mounted) return;
+      setState(() {
+        severity = recommendation!;
+        aiSuggested = recommendation;
+        aiReason = result['reason']?.toString() ?? 'No explanation provided.';
+        aiConfidence = (result['confidence'] as num?)?.toDouble();
+      });
+    } catch (error) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+        content: Text('AI verification failed: $error'),
+      ));
+    } finally {
+      if (mounted) setState(() => verifying = false);
+    }
+  }
+
+  Future<void> submitReport() async {
+    if (submitting || !form.currentState!.validate()) return;
+    final client = Supabase.instance.client;
+    final user = client.auth.currentUser;
+    if (user == null) {
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+        content: Text('Please sign in to submit a complaint.'),
+      ));
+      return;
+    }
+
+    setState(() => submitting = true);
+    String? trackingId;
+    try {
+      // Database defaults generate the complaint id, tracking id, status,
+      // reporter id, and timestamps.
+      final complaint = await client.from('complaints').insert({
+        'category': category,
+        'title': title.text.trim(),
+        'description': description.text.trim(),
+        'reported_severity': severity,
+        'address_text': address.text.trim(),
+      }).select('id, tracking_id').single();
+
+      final complaintId = complaint['id'] as String;
+      trackingId = complaint['tracking_id'] as String;
+
+      // The Storage INSERT policy requires:
+      // {auth.uid()}/{existing complaint id}/{filename}
+      if (selectedPhoto != null) {
+        try {
+          final bytes = await selectedPhoto!.readAsBytes();
+          if (bytes.length > 4 * 1024 * 1024) {
+            throw Exception('Photo exceeds 4 MB.');
+          }
+          final name = selectedPhoto!.path.toLowerCase();
+          final mime = name.endsWith('.png')
+              ? 'image/png'
+              : name.endsWith('.webp')
+                  ? 'image/webp'
+                  : 'image/jpeg';
+          final extension = mime == 'image/png'
+              ? 'png'
+              : mime == 'image/webp'
+                  ? 'webp'
+                  : 'jpg';
+          final path = '${user.id}/$complaintId/before.$extension';
+
+          await client.storage.from('complaint-images').uploadBinary(
+            path,
+            bytes,
+            fileOptions: FileOptions(contentType: mime, upsert: false),
+          );
+          await client.from('complaint_images').insert({
+            'complaint_id': complaintId,
+            'storage_path': path,
+            'image_type': 'before',
+          });
+        } catch (error) {
+          if (!mounted) return;
+          // Never retry the complaint insert here: it already succeeded.
+          ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+            duration: const Duration(seconds: 8),
+            content: Text('Complaint $trackingId saved, but the photo failed: $error'),
+          ));
+          widget.onSubmitted?.call();
+          return;
+        }
+      }
+
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+        content: Text('Complaint submitted! Tracking ID: $trackingId'),
+        duration: const Duration(seconds: 7),
+      ));
+      title.clear();
+      description.clear();
+      address.clear();
+      setState(() {
+        selectedPhoto = null;
+        aiSuggested = null;
+        aiReason = null;
+        aiConfidence = null;
+        severity = 'green';
+        category = 'water_leakage';
+      });
+      widget.onSubmitted?.call();
+    } catch (error) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+        content: Text('Complaint could not be submitted: $error'),
+        duration: const Duration(seconds: 7),
+      ));
+    } finally {
+      if (mounted) setState(() => submitting = false);
+    }
+  }
+
   @override
-  void dispose() { title.dispose(); description.dispose(); super.dispose(); }
+  void dispose() { title.dispose(); description.dispose(); address.dispose(); super.dispose(); }
 
   @override
   Widget build(BuildContext context) => SafeArea(child: ListView(
@@ -437,29 +661,59 @@ class _ReportScreenState extends State<ReportScreen> {
       const SizedBox(height: 24),
       Form(key: form, child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
         HydroCard(child: Column(children: [
-          Container(height: 120, width: double.infinity,
-            decoration: BoxDecoration(color: HydroColors.aqua,
-              borderRadius: BorderRadius.circular(16)),
-            child: const Column(mainAxisAlignment: MainAxisAlignment.center, children: [
-              Icon(Icons.add_a_photo_outlined, size: 35, color: HydroColors.teal),
-              SizedBox(height: 8), Text('Add a photo of the issue'),
-            ])),
+          InkWell(onTap: verifying ? null : selectPhoto,
+            borderRadius: BorderRadius.circular(16),
+            child: Container(height: 160, width: double.infinity,
+              decoration: BoxDecoration(color: HydroColors.aqua,
+                borderRadius: BorderRadius.circular(16)),
+              child: selectedPhoto == null
+                ? const Column(mainAxisAlignment: MainAxisAlignment.center, children: [
+                    Icon(Icons.add_a_photo_outlined, size: 35, color: HydroColors.teal),
+                    SizedBox(height: 8), Text('Add a photo of the issue'),
+                  ])
+                : ClipRRect(borderRadius: BorderRadius.circular(16),
+                    child: Image.file(File(selectedPhoto!.path), fit: BoxFit.cover)),
+            )),
           const SizedBox(height: 8),
-          const Text('Photo picker integration is the next step.',
+          const Text('Tap to take or choose a photo. It will be included in AI verification.',
             style: TextStyle(fontSize: 12, color: HydroColors.muted)),
         ])),
+        const SizedBox(height: 16),
+        DropdownButtonFormField<String>(
+          initialValue: category,
+          decoration: const InputDecoration(labelText: 'Issue category'),
+          items: const [
+            DropdownMenuItem(value: 'water_leakage', child: Text('Water Leakage')),
+            DropdownMenuItem(value: 'pipe_damage', child: Text('Pipe Damage')),
+            DropdownMenuItem(value: 'tap_faucet', child: Text('Tap / Faucet')),
+            DropdownMenuItem(value: 'tank_overflow', child: Text('Tank Overflow')),
+            DropdownMenuItem(value: 'water_pump', child: Text('Water Pump')),
+            DropdownMenuItem(value: 'other', child: Text('Other')),
+          ],
+          onChanged: submitting ? null : (value) {
+            if (value != null) setState(() => category = value);
+          },
+        ),
         const SizedBox(height: 16),
         TextFormField(controller: title, decoration: const InputDecoration(labelText: 'Issue title'),
           validator: (s) => (s == null || s.trim().isEmpty) ? 'Enter a title' : null),
         const SizedBox(height: 16),
         TextFormField(controller: description, maxLines: 4,
+          onChanged: (_) => setState(() { aiSuggested = null; aiReason = null; aiConfidence = null; }),
           decoration: const InputDecoration(labelText: 'Describe the problem'),
           validator: (s) => (s == null || s.trim().isEmpty) ? 'Describe the issue' : null),
         const SizedBox(height: 16),
-        const HydroCard(child: Row(children: [
-          Icon(Icons.location_on_outlined, color: HydroColors.teal),
-          SizedBox(width: 12), Expanded(child: Text('Location will be obtained with permission')),
-        ])),
+        TextFormField(
+          controller: address,
+          decoration: const InputDecoration(
+            labelText: 'Location / address',
+            prefixIcon: Icon(Icons.location_on_outlined),
+            hintText: 'Street, landmark, or building',
+          ),
+          validator: (value) => (value == null || value.trim().isEmpty)
+              ? 'Enter where the problem is located'
+              : null,
+        ),
         const SizedBox(height: 24),
         const _SectionTitle('Select Severity'),
         const SizedBox(height: 12),
@@ -473,15 +727,39 @@ class _ReportScreenState extends State<ReportScreen> {
           'Urgent attention from BMC', HydroColors.red, severity,
           (s) => setState(() => severity = s)),
         const SizedBox(height: 12),
-        OutlinedButton.icon(onPressed: () => ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('AI verification will connect to the existing Edge Function.'))),
-          icon: const Icon(Icons.auto_awesome), label: const Text('AI Verify Severity')),
+        OutlinedButton.icon(
+          onPressed: verifying ? null : verifySeverity,
+          icon: verifying
+              ? const SizedBox(width: 18, height: 18,
+                  child: CircularProgressIndicator(strokeWidth: 2))
+              : const Icon(Icons.auto_awesome),
+          label: Text(verifying ? 'Checking severity...' : 'AI Verify Severity'),
+        ),
+        if (aiReason != null) ...[
+          const SizedBox(height: 12),
+          HydroCard(child: Column(crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text('AI suggests ${aiSuggested!.toUpperCase()}',
+                style: const TextStyle(fontWeight: FontWeight.bold)),
+              const SizedBox(height: 8),
+              Text(aiReason!),
+              if (aiConfidence != null) ...[
+                const SizedBox(height: 6),
+                Text('Model-reported confidence: ${(aiConfidence! * 100).round()}%',
+                  style: const TextStyle(color: HydroColors.muted)),
+              ],
+              const SizedBox(height: 8),
+              const Text('This is advisory. You can change the selected severity.'),
+            ])),
+        ],
         const SizedBox(height: 18),
-        FilledButton(onPressed: () {
-          if (!form.currentState!.validate()) return;
-          ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content:
-            Text('Preview only — report was not submitted to Supabase.')));
-        }, child: const Text('Submit Report')),
+        FilledButton(
+          onPressed: submitting ? null : submitReport,
+          child: submitting
+              ? const SizedBox(width: 20, height: 20,
+                  child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white))
+              : const Text('Submit Report'),
+        ),
       ])),
     ],
   ));
@@ -510,23 +788,73 @@ class _SeverityTile extends StatelessWidget {
   );
 }
 
-class TrackScreen extends StatelessWidget {
+class TrackScreen extends StatefulWidget {
   const TrackScreen({super.key});
   @override
+  State<TrackScreen> createState() => _TrackScreenState();
+}
+
+class _TrackScreenState extends State<TrackScreen> {
+  Future<List<Map<String, dynamic>>> loadComplaints() async {
+    final client = Supabase.instance.client;
+    final user = client.auth.currentUser;
+    if (user == null) return [];
+    final results = await client.from('complaints')
+        .select('id, tracking_id, title, description, reported_severity, status, address_text, created_at')
+        .eq('reported_by', user.id)
+        .order('created_at', ascending: false)
+        .limit(50);
+    return List<Map<String, dynamic>>.from(results);
+  }
+
+  @override
   Widget build(BuildContext context) => SafeArea(child: ListView(
-    padding: EdgeInsets.all(24), children: [
-      _SectionTitle('Track Complaint'),
-      SizedBox(height: 8),
-      Text('View updates on your reported issues.', style: TextStyle(color: HydroColors.muted)),
-      SizedBox(height: 24),
-      HydroCard(child: Column(children: [
-        Icon(Icons.fact_check_outlined, size: 54, color: HydroColors.teal),
-        SizedBox(height: 12),
-        Text('No complaints loaded', style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
-        SizedBox(height: 8),
-        Text('Complaint tracking will read from your Supabase complaints table.',
-          textAlign: TextAlign.center, style: TextStyle(color: HydroColors.muted)),
-      ])),
+    padding: const EdgeInsets.all(24), children: [
+      Row(children: [
+        const Expanded(child: _SectionTitle('Track Complaint')),
+        IconButton(
+          tooltip: 'Refresh complaints',
+          onPressed: () => setState(() {}),
+          icon: const Icon(Icons.refresh),
+        ),
+      ]),
+      const SizedBox(height: 8),
+      const Text('View updates on your reported issues.',
+        style: TextStyle(color: HydroColors.muted)),
+      const SizedBox(height: 24),
+      FutureBuilder<List<Map<String, dynamic>>>(
+        future: loadComplaints(),
+        builder: (context, snapshot) {
+          if (snapshot.connectionState != ConnectionState.done) {
+            return const Center(child: CircularProgressIndicator());
+          }
+          if (snapshot.hasError) {
+            return HydroCard(child: Text('Could not load complaints: ${snapshot.error}'));
+          }
+          final complaints = snapshot.data ?? [];
+          if (complaints.isEmpty) {
+            return const HydroCard(child: Text('No complaints yet. Submit your first report.'));
+          }
+          return Column(children: [
+            for (final complaint in complaints)
+              HydroCard(child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(complaint['tracking_id']?.toString() ?? '',
+                    style: const TextStyle(fontWeight: FontWeight.bold, color: HydroColors.teal)),
+                  const SizedBox(height: 8),
+                  Text(complaint['title']?.toString().isNotEmpty == true
+                      ? complaint['title'].toString()
+                      : complaint['description']?.toString() ?? 'Complaint'),
+                  const SizedBox(height: 8),
+                  Text('Status: ${complaint['status']?.toString().replaceAll('_', ' ') ?? 'Unknown'}'),
+                  Text('Severity: ${complaint['reported_severity'] ?? 'Unknown'}'),
+                  Text('Location: ${complaint['address_text'] ?? ''}'),
+                ],
+              )),
+          ]);
+        },
+      ),
     ],
   ));
 }

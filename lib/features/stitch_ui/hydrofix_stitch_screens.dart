@@ -6,6 +6,22 @@ import 'package:image_picker/image_picker.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 import '../../core/theme/hydrofix_theme.dart';
 
+// HydroFix displays three colors, but public.complaints.reported_severity
+// uses the PostgreSQL enum labels low, medium, high, emergency.
+// Reserve 'high' for future use; critical public leaks require emergency.
+String severityToDatabase(String color) {
+  switch (color.trim().toLowerCase()) {
+    case 'green':
+      return 'low';
+    case 'yellow':
+      return 'medium';
+    case 'red':
+      return 'emergency';
+    default:
+      throw ArgumentError.value(color, 'color', 'Unknown severity');
+  }
+}
+
 // These UI screens use sample content where backend integration is pending.
 // The citizen sign-in form calls the existing Supabase Auth client.
 
@@ -525,10 +541,6 @@ class _ReportScreenState extends State<ReportScreen> {
         'verify-severity',
         body: body,
       );
-      debugPrint('========== AI RESPONSE ==========');
-      debugPrint('Status: ${response.status}');
-      debugPrint('Data: ${response.data}');
-debugPrint('=================================');
       if (response.status != 200 || response.data is! Map) {
         throw Exception('AI verification unavailable (${response.status}).');
       }
@@ -558,6 +570,9 @@ debugPrint('=================================');
     if (submitting || !form.currentState!.validate()) return;
     final client = Supabase.instance.client;
     final user = client.auth.currentUser;
+    debugPrint('COMPLAINT USER ID: ${user?.id}');
+    debugPrint('COMPLAINT USER EMAIL: ${user?.email}');
+    debugPrint('SESSION ACTIVE: ${client.auth.currentSession != null}');
     if (user == null) {
       ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
         content: Text('Please sign in to submit a complaint.'),
@@ -574,7 +589,7 @@ debugPrint('=================================');
         'category': category,
         'title': title.text.trim(),
         'description': description.text.trim(),
-        'reported_severity': severity,
+        'reported_severity': severityToDatabase(severity),
         'address_text': address.text.trim(),
       }).select('id, tracking_id').single();
 
@@ -894,60 +909,2021 @@ class HydroNotifications extends StatelessWidget {
       child: Text('Your Supabase notifications will appear here.'))));
 }
 
-class ProfessionalDashboardPreview extends StatelessWidget {
+class ProfessionalDashboardPreview extends StatefulWidget {
   const ProfessionalDashboardPreview({super.key});
+
   @override
-  Widget build(BuildContext context) => Scaffold(
-    appBar: AppBar(title: const Text('Professional Dashboard')),
-    body: SafeArea(child: ListView(padding: const EdgeInsets.all(24), children: [
-      const Text('Good morning, Technician', style: TextStyle(fontSize: 24,
-        fontWeight: FontWeight.bold, color: HydroColors.navy)),
-      const SizedBox(height: 8),
-      const Text('Manage your plumbing and electrical jobs.',
-        style: TextStyle(color: HydroColors.muted)),
-      const SizedBox(height: 24),
-      const Row(children: [
-        Expanded(child: _Metric('—', 'Assigned', Icons.assignment)),
-        SizedBox(width: 12),
-        Expanded(child: _Metric('—', 'Completed', Icons.task_alt)),
-      ]),
-      const SizedBox(height: 24),
-      const _SectionTitle('Assigned Jobs'),
-      const SizedBox(height: 12),
-      const HydroCard(child: Text('Jobs will load from complaint_assignments after technician authorization is connected.')),
-    ])),
-  );
+  State<ProfessionalDashboardPreview> createState() =>
+      _ProfessionalDashboardPreviewState();
 }
 
-class BmcDashboardPreview extends StatelessWidget {
-  const BmcDashboardPreview({super.key});
+class _ProfessionalDashboardPreviewState
+    extends State<ProfessionalDashboardPreview> {
+  bool loading = true;
+
+  String? errorMessage;
+  String? updatingJobId;
+
+  List<Map<String, dynamic>> jobs = [];
+
+  int get assignedCount => jobs.where((job) {
+        final status = job['status']?.toString();
+
+        return status != 'completed' &&
+            status != 'confirmed' &&
+            status != 'rejected';
+      }).length;
+
+  int get completedCount => jobs.where((job) {
+        final status = job['status']?.toString();
+
+        return status == 'completed' ||
+            status == 'confirmed';
+      }).length;
+
   @override
-  Widget build(BuildContext context) => Scaffold(
-    appBar: AppBar(title: const Text('BMC Officer Dashboard')),
-    body: SafeArea(child: ListView(padding: const EdgeInsets.all(24), children: [
-      const Text('Water Issue Overview', style: TextStyle(fontSize: 25,
-        fontWeight: FontWeight.bold, color: HydroColors.navy)),
-      const SizedBox(height: 10),
-      const Text('Ward-level monitoring and urgent alerts',
-        style: TextStyle(color: HydroColors.muted)),
-      const SizedBox(height: 20),
-      Container(padding: const EdgeInsets.all(18), decoration: BoxDecoration(
-        color: const Color(0xFFFFE7E7), borderRadius: BorderRadius.circular(16)),
-        child: const Row(children: [
-          Icon(Icons.warning_amber_rounded, color: HydroColors.red), SizedBox(width: 12),
-          Expanded(child: Text('Critical alerts will appear here when connected to BMC area memberships.')),
-        ])),
-      const SizedBox(height: 24),
-      const Row(children: [
-        Expanded(child: _Metric('—', 'Green', Icons.water_drop_outlined)),
-        SizedBox(width: 10),
-        Expanded(child: _Metric('—', 'Yellow', Icons.build_outlined)),
-        SizedBox(width: 10),
-        Expanded(child: _Metric('—', 'Red', Icons.warning_amber)),
-      ]),
-      const SizedBox(height: 24), const _SectionTitle('Area Issues'),
-      const SizedBox(height: 12),
-      const HydroCard(child: Text('This view needs authorized area membership and live complaint queries.')),
-    ])),
-  );
+  void initState() {
+    super.initState();
+    loadJobs();
+  }
+
+  // ============================================================
+  // LOAD PROFESSIONAL JOBS
+  // ============================================================
+
+  Future<void> loadJobs() async {
+    if (!mounted) return;
+
+    setState(() {
+      loading = true;
+      errorMessage = null;
+    });
+
+    try {
+      final client = Supabase.instance.client;
+
+      final user = client.auth.currentUser;
+
+      if (user == null) {
+        throw Exception(
+          'Please log in as a professional.',
+        );
+      }
+
+      // Verify professional account.
+      final professional = await client
+          .from('professional_profiles')
+          .select(
+            'user_id, specialization, verification_status',
+          )
+          .eq('user_id', user.id)
+          .maybeSingle();
+
+      if (professional == null ||
+          professional['verification_status'] !=
+              'approved') {
+        throw Exception(
+          'Your professional account is not approved.',
+        );
+      }
+
+      // Load jobs assigned to the logged-in professional.
+      final jobData = await client
+          .from('jobs')
+          .select(
+            'id, complaint_id, professional_id, '
+            'status, estimated_payout_paise, '
+            'estimated_duration_minutes, '
+            'rejection_reason, completion_notes, '
+            'offered_at, accepted_at, started_at, '
+            'completed_at',
+          )
+          .eq('professional_id', user.id)
+          .order('offered_at', ascending: false);
+
+      // Attach complaint details to each job.
+      final List<Map<String, dynamic>> loadedJobs = [];
+
+      for (final job in jobData) {
+        final jobMap = Map<String, dynamic>.from(job);
+
+        final complaintId =
+            jobMap['complaint_id']?.toString();
+
+        Map<String, dynamic>? complaint;
+
+        if (complaintId != null) {
+          final complaintData = await client
+              .from('complaints')
+              .select(
+                'id, tracking_id, title, description, '
+                'reported_severity, status, address_text',
+              )
+              .eq('id', complaintId)
+              .maybeSingle();
+
+          if (complaintData != null) {
+            complaint =
+                Map<String, dynamic>.from(complaintData);
+          }
+        }
+
+        jobMap['complaint'] = complaint;
+
+        loadedJobs.add(jobMap);
+      }
+
+      if (!mounted) return;
+
+      setState(() {
+        jobs = loadedJobs;
+        loading = false;
+      });
+    } catch (error) {
+      if (!mounted) return;
+
+      setState(() {
+        errorMessage = error.toString();
+        loading = false;
+      });
+    }
+  }
+
+  // ============================================================
+  // UPDATE JOB STATUS
+  // ============================================================
+
+  Future<void> updateJobStatus({
+    required String jobId,
+    required String newStatus,
+  }) async {
+    if (updatingJobId != null) return;
+
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) {
+        return AlertDialog(
+          title: Text(
+            'Confirm ${statusLabel(newStatus)}',
+          ),
+          content: Text(
+            'Are you sure you want to change '
+            'this job to "${statusLabel(newStatus)}"?',
+          ),
+          actions: [
+            TextButton(
+              onPressed: () =>
+                  Navigator.pop(dialogContext, false),
+              child: const Text('Cancel'),
+            ),
+            FilledButton(
+              onPressed: () =>
+                  Navigator.pop(dialogContext, true),
+              child: const Text('Confirm'),
+            ),
+          ],
+        );
+      },
+    );
+
+    if (confirmed != true || !mounted) return;
+
+    setState(() {
+      updatingJobId = jobId;
+    });
+
+    try {
+      final client = Supabase.instance.client;
+
+      if (client.auth.currentUser == null) {
+        throw Exception('Please log in again.');
+      }
+
+      await client.rpc(
+        'update_my_job',
+        params: {
+          'p_job': jobId,
+          'p_new_status': newStatus,
+          'p_note': newStatus == 'completed'
+              ? 'Repair completed by professional'
+              : newStatus == 'rejected'
+                  ? 'Job rejected by professional'
+                  : 'Status updated by professional',
+        },
+      );
+
+      if (!mounted) return;
+
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            'Job status updated to '
+            '${statusLabel(newStatus)}',
+          ),
+          backgroundColor: HydroColors.teal,
+        ),
+      );
+
+      await loadJobs();
+    } catch (error) {
+      if (!mounted) return;
+
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            'Unable to update job: $error',
+          ),
+          backgroundColor: HydroColors.red,
+        ),
+      );
+    } finally {
+      if (mounted) {
+        setState(() {
+          updatingJobId = null;
+        });
+      }
+    }
+  }
+
+  // ============================================================
+  // STATUS HELPERS
+  // ============================================================
+
+  String statusLabel(String status) {
+    switch (status) {
+      case 'offered':
+        return 'Job Offered';
+
+      case 'accepted':
+        return 'Accepted';
+
+      case 'rejected':
+        return 'Rejected';
+
+      case 'on_the_way':
+        return 'On the Way';
+
+      case 'in_progress':
+        return 'In Progress';
+
+      case 'completed':
+        return 'Completed';
+
+      case 'confirmed':
+        return 'Confirmed';
+
+      default:
+        return status.replaceAll('_', ' ').toUpperCase();
+    }
+  }
+
+  String severityLabel(String severity) {
+    switch (severity) {
+      case 'low':
+        return 'GREEN';
+
+      case 'medium':
+        return 'YELLOW';
+
+      case 'high':
+      case 'emergency':
+        return 'RED';
+
+      default:
+        return severity.toUpperCase();
+    }
+  }
+
+  Color severityColor(String severity) {
+    switch (severity) {
+      case 'low':
+        return HydroColors.green;
+
+      case 'medium':
+        return HydroColors.yellow;
+
+      case 'high':
+      case 'emergency':
+        return HydroColors.red;
+
+      default:
+        return HydroColors.muted;
+    }
+  }
+
+  // ============================================================
+  // JOB ACTION BUTTON
+  // ============================================================
+
+  Widget buildActionButton({
+    required String jobId,
+    required String status,
+    required String label,
+    required IconData icon,
+    bool outlined = false,
+  }) {
+    final isProcessing = updatingJobId == jobId;
+
+    if (outlined) {
+      return OutlinedButton.icon(
+        onPressed: updatingJobId != null
+            ? null
+            : () => updateJobStatus(
+                  jobId: jobId,
+                  newStatus: status,
+                ),
+        icon: Icon(icon),
+        label: Text(label),
+      );
+    }
+
+    return FilledButton.icon(
+      onPressed: updatingJobId != null
+          ? null
+          : () => updateJobStatus(
+                jobId: jobId,
+                newStatus: status,
+              ),
+      icon: isProcessing
+          ? const SizedBox(
+              height: 16,
+              width: 16,
+              child: CircularProgressIndicator(
+                strokeWidth: 2,
+              ),
+            )
+          : Icon(icon),
+      label: Text(label),
+    );
+  }
+
+  // ============================================================
+  // JOB CARD
+  // ============================================================
+
+  Widget buildJobCard(Map<String, dynamic> job) {
+    final jobId = job['id']?.toString() ?? '';
+
+    final status =
+        job['status']?.toString() ?? 'unknown';
+
+    final complaint =
+        job['complaint'] is Map
+            ? Map<String, dynamic>.from(
+                job['complaint'] as Map,
+              )
+            : <String, dynamic>{};
+
+    final title =
+        complaint['title']?.toString() ??
+            'Water Issue';
+
+    final trackingId =
+        complaint['tracking_id']?.toString() ??
+            'N/A';
+
+    final description =
+        complaint['description']?.toString() ?? '';
+
+    final address =
+        complaint['address_text']?.toString() ??
+            'Not provided';
+
+    final severity =
+        complaint['reported_severity']?.toString() ??
+            'unknown';
+
+    final duration =
+        job['estimated_duration_minutes'];
+
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 16),
+      child: HydroCard(
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            // Complaint title.
+            Row(
+              children: [
+                Icon(
+                  Icons.water_drop,
+                  color: severityColor(severity),
+                  size: 28,
+                ),
+
+                const SizedBox(width: 10),
+
+                Expanded(
+                  child: Text(
+                    title,
+                    style: const TextStyle(
+                      fontSize: 18,
+                      fontWeight: FontWeight.bold,
+                      color: HydroColors.navy,
+                    ),
+                  ),
+                ),
+              ],
+            ),
+
+            const SizedBox(height: 14),
+
+            Text(
+              'Tracking ID: $trackingId',
+              style: const TextStyle(
+                color: HydroColors.teal,
+                fontWeight: FontWeight.w600,
+              ),
+            ),
+
+            const SizedBox(height: 10),
+
+            Text(
+              'Severity: ${severityLabel(severity)}',
+            ),
+
+            const SizedBox(height: 8),
+
+            Text(
+              'Job Status: ${statusLabel(status)}',
+              style: const TextStyle(
+                fontWeight: FontWeight.bold,
+              ),
+            ),
+
+            const SizedBox(height: 8),
+
+            Text('Location: $address'),
+
+            if (duration != null) ...[
+              const SizedBox(height: 8),
+
+              Text(
+                'Estimated Duration: $duration minutes',
+              ),
+            ],
+
+            if (description.isNotEmpty) ...[
+              const SizedBox(height: 12),
+
+              Text(
+                description,
+                style: const TextStyle(
+                  color: HydroColors.muted,
+                ),
+              ),
+            ],
+
+            const SizedBox(height: 20),
+
+            // ==========================================
+            // OFFERED: ACCEPT OR REJECT
+            // ==========================================
+
+            if (status == 'offered')
+              Column(
+                children: [
+                  SizedBox(
+                    width: double.infinity,
+                    child: buildActionButton(
+                      jobId: jobId,
+                      status: 'accepted',
+                      label: 'Accept Job',
+                      icon: Icons.check_circle,
+                    ),
+                  ),
+
+                  const SizedBox(height: 8),
+
+                  SizedBox(
+                    width: double.infinity,
+                    child: buildActionButton(
+                      jobId: jobId,
+                      status: 'rejected',
+                      label: 'Reject Job',
+                      icon: Icons.cancel_outlined,
+                      outlined: true,
+                    ),
+                  ),
+                ],
+              ),
+
+            // ==========================================
+            // ACCEPTED: ON THE WAY
+            // ==========================================
+
+            if (status == 'accepted')
+              SizedBox(
+                width: double.infinity,
+                child: buildActionButton(
+                  jobId: jobId,
+                  status: 'on_the_way',
+                  label: 'On the Way',
+                  icon: Icons.directions_walk,
+                ),
+              ),
+
+            // ==========================================
+            // ON THE WAY: START WORK
+            // ==========================================
+
+            if (status == 'on_the_way')
+              SizedBox(
+                width: double.infinity,
+                child: buildActionButton(
+                  jobId: jobId,
+                  status: 'in_progress',
+                  label: 'Start Work',
+                  icon: Icons.build,
+                ),
+              ),
+
+            // ==========================================
+            // IN PROGRESS: COMPLETE
+            // ==========================================
+
+            if (status == 'in_progress')
+              SizedBox(
+                width: double.infinity,
+                child: buildActionButton(
+                  jobId: jobId,
+                  status: 'completed',
+                  label: 'Mark Completed',
+                  icon: Icons.task_alt,
+                ),
+              ),
+
+            // ==========================================
+            // COMPLETED
+            // ==========================================
+
+            if (status == 'completed' ||
+                status == 'confirmed')
+              const Row(
+                children: [
+                  Icon(
+                    Icons.check_circle,
+                    color: HydroColors.green,
+                  ),
+
+                  SizedBox(width: 10),
+
+                  Expanded(
+                    child: Text(
+                      'Repair completed successfully.',
+                      style: TextStyle(
+                        color: HydroColors.green,
+                        fontWeight: FontWeight.bold,
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+
+            // ==========================================
+            // REJECTED
+            // ==========================================
+
+            if (status == 'rejected')
+              const Text(
+                'You rejected this job.',
+                style: TextStyle(
+                  color: HydroColors.red,
+                  fontWeight: FontWeight.bold,
+                ),
+              ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  // ============================================================
+  // DASHBOARD UI
+  // ============================================================
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text(
+          'Professional Dashboard',
+        ),
+        actions: [
+          IconButton(
+            tooltip: 'Refresh jobs',
+            onPressed: loading || updatingJobId != null
+                ? null
+                : loadJobs,
+            icon: const Icon(Icons.refresh),
+          ),
+        ],
+      ),
+
+      body: SafeArea(
+        child: RefreshIndicator(
+          onRefresh: loadJobs,
+
+          child: ListView(
+            physics:
+                const AlwaysScrollableScrollPhysics(),
+
+            padding: const EdgeInsets.all(24),
+
+            children: [
+              const Text(
+                'Good morning, Technician',
+                style: TextStyle(
+                  fontSize: 24,
+                  fontWeight: FontWeight.bold,
+                  color: HydroColors.navy,
+                ),
+              ),
+
+              const SizedBox(height: 8),
+
+              const Text(
+                'Manage your plumbing and electrical jobs.',
+                style: TextStyle(
+                  color: HydroColors.muted,
+                ),
+              ),
+
+              const SizedBox(height: 24),
+
+              // ==========================================
+              // LOADING
+              // ==========================================
+
+              if (loading)
+                const Center(
+                  child: Padding(
+                    padding: EdgeInsets.all(32),
+                    child: CircularProgressIndicator(),
+                  ),
+                )
+
+              // ==========================================
+              // ERROR
+              // ==========================================
+
+              else if (errorMessage != null)
+                HydroCard(
+                  child: Column(
+                    children: [
+                      const Icon(
+                        Icons.error_outline,
+                        color: HydroColors.red,
+                        size: 40,
+                      ),
+
+                      const SizedBox(height: 12),
+
+                      const Text(
+                        'Unable to load professional jobs',
+                        style: TextStyle(
+                          fontWeight: FontWeight.bold,
+                        ),
+                      ),
+
+                      const SizedBox(height: 10),
+
+                      Text(
+                        errorMessage!,
+                        textAlign: TextAlign.center,
+                      ),
+
+                      const SizedBox(height: 16),
+
+                      FilledButton(
+                        onPressed: loadJobs,
+                        child: const Text('Retry'),
+                      ),
+                    ],
+                  ),
+                )
+
+              // ==========================================
+              // DASHBOARD CONTENT
+              // ==========================================
+
+              else ...[
+                // ========================================
+                // JOB COUNTERS
+                // ========================================
+
+                Row(
+                  children: [
+                    Expanded(
+                      child: _Metric(
+                        '$assignedCount',
+                        'Assigned',
+                        Icons.assignment,
+                      ),
+                    ),
+
+                    const SizedBox(width: 12),
+
+                    Expanded(
+                      child: _Metric(
+                        '$completedCount',
+                        'Completed',
+                        Icons.task_alt,
+                      ),
+                    ),
+                  ],
+                ),
+
+                const SizedBox(height: 24),
+
+                const _SectionTitle('Assigned Jobs'),
+
+                const SizedBox(height: 12),
+
+                if (jobs.isEmpty)
+                  const HydroCard(
+                    child: Padding(
+                      padding: EdgeInsets.all(20),
+                      child: Center(
+                        child: Text(
+                          'No jobs assigned to you yet.',
+                          textAlign: TextAlign.center,
+                        ),
+                      ),
+                    ),
+                  )
+                else
+                  ...jobs.map(buildJobCard),
+              ],
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class BmcDashboardPreview extends StatefulWidget {
+  const BmcDashboardPreview({super.key});
+
+  @override
+  State<BmcDashboardPreview> createState() =>
+      _BmcDashboardPreviewState();
+}
+
+class _BmcDashboardPreviewState extends State<BmcDashboardPreview> {
+  bool loading = true;
+
+  String? errorMessage;
+  String? wardId;
+  String wardName = 'Assigned Ward';
+
+  List<Map<String, dynamic>> complaints = [];
+
+  List<Map<String, dynamic>> pendingProfessionals = [];
+
+  List<Map<String, dynamic>> approvedProfessionals = [];
+
+  String? reviewingProfessionalId;
+  String? assigningComplaintId;
+
+  bool get isReviewingProfessional =>
+      reviewingProfessionalId != null;
+
+  int get greenCount => complaints
+      .where((c) => c['reported_severity'] == 'low')
+      .length;
+
+  int get yellowCount => complaints
+      .where((c) => c['reported_severity'] == 'medium')
+      .length;
+
+  int get redCount => complaints
+      .where(
+        (c) =>
+            c['reported_severity'] == 'high' ||
+            c['reported_severity'] == 'emergency',
+      )
+      .length;
+
+  @override
+  void initState() {
+    super.initState();
+    loadDashboard();
+  }
+
+  // ============================================================
+  // LOAD DASHBOARD DATA
+  // ============================================================
+
+  Future<void> loadDashboard() async {
+    if (!mounted) return;
+
+    setState(() {
+      loading = true;
+      errorMessage = null;
+    });
+
+    try {
+      final client = Supabase.instance.client;
+      final user = client.auth.currentUser;
+
+      if (user == null) {
+        throw Exception('Please log in as a BMC officer.');
+      }
+
+      // Get the BMC officer's ward.
+      final adminData = await client
+          .from('admin_profiles')
+          .select('ward_id')
+          .eq('user_id', user.id)
+          .maybeSingle();
+
+      if (adminData == null) {
+        throw Exception(
+          'No authorized BMC officer profile found.',
+        );
+      }
+
+      final assignedWardId =
+          adminData['ward_id']?.toString();
+
+      if (assignedWardId == null ||
+          assignedWardId.isEmpty) {
+        throw Exception(
+          'No ward assigned to this BMC officer.',
+        );
+      }
+
+      // Get ward name.
+      final wardData = await client
+          .from('wards')
+          .select('name')
+          .eq('id', assignedWardId)
+          .maybeSingle();
+
+      // Get complaints belonging to this ward.
+      final complaintData = await client
+          .from('complaints')
+          .select(
+            'id, tracking_id, title, description, '
+            'reported_severity, status, address_text, '
+            'ward_id, assigned_professional_id, created_at',
+          )
+          .eq('ward_id', assignedWardId)
+          .order('created_at', ascending: false);
+
+      // Get pending professional applications.
+      final pendingData = await client
+          .from('professional_profiles')
+          .select(
+            'user_id, partner_id, specialization, '
+            'service_ward_id, service_area, '
+            'verification_status, availability, '
+            'bio, experience_years, created_at',
+          )
+          .eq('service_ward_id', assignedWardId)
+          .eq('verification_status', 'pending')
+          .order('created_at', ascending: false);
+
+      // Get approved professionals eligible for assignment.
+      final approvedData = await client
+          .from('professional_profiles')
+          .select(
+            'user_id, partner_id, specialization, '
+            'service_ward_id, service_area, '
+            'verification_status, availability, '
+            'bio, experience_years',
+          )
+          .eq('service_ward_id', assignedWardId)
+          .eq('verification_status', 'approved')
+          .order('partner_id');
+
+      if (!mounted) return;
+
+      setState(() {
+        wardId = assignedWardId;
+
+        wardName =
+            wardData?['name']?.toString() ??
+            'Assigned Ward';
+
+        complaints =
+            List<Map<String, dynamic>>.from(
+          complaintData,
+        );
+
+        pendingProfessionals =
+            List<Map<String, dynamic>>.from(
+          pendingData,
+        );
+
+        approvedProfessionals =
+            List<Map<String, dynamic>>.from(
+          approvedData,
+        );
+
+        loading = false;
+      });
+    } catch (error) {
+      if (!mounted) return;
+
+      setState(() {
+        errorMessage = error.toString();
+        loading = false;
+      });
+    }
+  }
+
+  // ============================================================
+  // REVIEW PROFESSIONAL
+  // ============================================================
+
+  Future<void> reviewProfessional({
+    required String professionalId,
+    required String status,
+  }) async {
+    if (isReviewingProfessional) return;
+
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) {
+        return AlertDialog(
+          title: Text(
+            status == 'approved'
+                ? 'Approve Professional?'
+                : 'Reject Professional?',
+          ),
+          content: Text(
+            status == 'approved'
+                ? 'Are you sure you want to approve '
+                    'this professional?'
+                : 'Are you sure you want to reject '
+                    'this professional?',
+          ),
+          actions: [
+            TextButton(
+              onPressed: () =>
+                  Navigator.pop(dialogContext, false),
+              child: const Text('Cancel'),
+            ),
+            FilledButton(
+              onPressed: () =>
+                  Navigator.pop(dialogContext, true),
+              child: Text(
+                status == 'approved'
+                    ? 'Approve'
+                    : 'Reject',
+              ),
+            ),
+          ],
+        );
+      },
+    );
+
+    if (confirmed != true || !mounted) return;
+
+    setState(() {
+      reviewingProfessionalId = professionalId;
+    });
+
+    try {
+      final client = Supabase.instance.client;
+
+      if (client.auth.currentUser == null) {
+        throw Exception('BMC officer is not logged in.');
+      }
+
+      await client.rpc(
+        'review_professional',
+        params: {
+          'p_professional': professionalId,
+          'p_status': status,
+          'p_reason': status == 'approved'
+              ? 'Approved by BMC officer'
+              : 'Rejected by BMC officer',
+        },
+      );
+
+      if (!mounted) return;
+
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            status == 'approved'
+                ? 'Professional approved successfully!'
+                : 'Professional application rejected.',
+          ),
+          backgroundColor: status == 'approved'
+              ? HydroColors.teal
+              : HydroColors.red,
+        ),
+      );
+
+      await loadDashboard();
+    } catch (error) {
+      if (!mounted) return;
+
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            'Professional review failed: $error',
+          ),
+          backgroundColor: HydroColors.red,
+        ),
+      );
+    } finally {
+      if (mounted) {
+        setState(() {
+          reviewingProfessionalId = null;
+        });
+      }
+    }
+  }
+
+  // ============================================================
+  // ASSIGN JOB
+  // ============================================================
+
+  Future<void> assignProfessional({
+    required String complaintId,
+    required String professionalId,
+  }) async {
+    if (assigningComplaintId != null) return;
+
+    setState(() {
+      assigningComplaintId = complaintId;
+    });
+
+    try {
+      final client = Supabase.instance.client;
+
+      if (client.auth.currentUser == null) {
+        throw Exception('Please log in as a BMC officer.');
+      }
+
+      final jobId = await client.rpc(
+        'assign_job',
+        params: {
+          'p_complaint': complaintId,
+          'p_professional': professionalId,
+          'p_amount_paise': null,
+          'p_minutes': null,
+        },
+      );
+
+      if (!mounted) return;
+
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            'Job assigned successfully! Job ID: $jobId',
+          ),
+          backgroundColor: HydroColors.teal,
+        ),
+      );
+
+      await loadDashboard();
+    } catch (error) {
+      if (!mounted) return;
+
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            'Job assignment failed: $error',
+          ),
+          backgroundColor: HydroColors.red,
+        ),
+      );
+    } finally {
+      if (mounted) {
+        setState(() {
+          assigningComplaintId = null;
+        });
+      }
+    }
+  }
+
+  // ============================================================
+  // SHOW APPROVED PROFESSIONALS
+  // ============================================================
+
+  Future<void> showAssignProfessionalDialog(
+    Map<String, dynamic> complaint,
+  ) async {
+    if (assigningComplaintId != null) return;
+
+    final complaintId =
+        complaint['id']?.toString();
+
+    if (complaintId == null || complaintId.isEmpty) {
+      return;
+    }
+
+    if (approvedProfessionals.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text(
+            'No approved professionals available '
+            'in this ward.',
+          ),
+        ),
+      );
+      return;
+    }
+
+    final selectedProfessional =
+        await showDialog<Map<String, dynamic>>(
+      context: context,
+      builder: (dialogContext) {
+        return AlertDialog(
+          title: const Text(
+            'Select Professional',
+          ),
+
+          content: SizedBox(
+            width: double.maxFinite,
+            child: ListView.builder(
+              shrinkWrap: true,
+              itemCount: approvedProfessionals.length,
+              itemBuilder: (context, index) {
+                final professional =
+                    approvedProfessionals[index];
+
+                final specialization =
+                    professional['specialization']
+                            ?.toString() ??
+                        'Unknown';
+
+                final partnerId =
+                    professional['partner_id']
+                            ?.toString() ??
+                        'N/A';
+
+                final serviceArea =
+                    professional['service_area']
+                            ?.toString() ??
+                        'Not specified';
+
+                final availability =
+                    professional['availability']
+                            ?.toString() ??
+                        'unknown';
+
+                return ListTile(
+                  leading: Icon(
+                    specialization == 'electrician'
+                        ? Icons.electrical_services
+                        : Icons.plumbing,
+                    color: HydroColors.teal,
+                  ),
+
+                  title: Text(
+                    '$partnerId - $specialization',
+                  ),
+
+                  subtitle: Text(
+                    '$serviceArea\n'
+                    'Availability: $availability',
+                  ),
+
+                  isThreeLine: true,
+
+                  onTap: () {
+                    Navigator.pop(
+                      dialogContext,
+                      professional,
+                    );
+                  },
+                );
+              },
+            ),
+          ),
+
+          actions: [
+            TextButton(
+              onPressed: () =>
+                  Navigator.pop(dialogContext),
+              child: const Text('Cancel'),
+            ),
+          ],
+        );
+      },
+    );
+
+    if (!mounted || selectedProfessional == null) {
+      return;
+    }
+
+    final professionalId =
+        selectedProfessional['user_id']?.toString();
+
+    if (professionalId == null ||
+        professionalId.isEmpty) {
+      return;
+    }
+
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) {
+        return AlertDialog(
+          title: const Text(
+            'Confirm Job Assignment',
+          ),
+
+          content: Text(
+            'Assign "${complaint['title']}" to '
+            '${selectedProfessional['partner_id']} '
+            '(${selectedProfessional['specialization']})?',
+          ),
+
+          actions: [
+            TextButton(
+              onPressed: () =>
+                  Navigator.pop(dialogContext, false),
+              child: const Text('Cancel'),
+            ),
+
+            FilledButton(
+              onPressed: () =>
+                  Navigator.pop(dialogContext, true),
+              child: const Text('Assign Job'),
+            ),
+          ],
+        );
+      },
+    );
+
+    if (confirmed != true || !mounted) return;
+
+    await assignProfessional(
+      complaintId: complaintId,
+      professionalId: professionalId,
+    );
+  }
+
+  // ============================================================
+  // SEVERITY LABEL
+  // ============================================================
+
+  String severityLabel(String value) {
+    switch (value) {
+      case 'low':
+        return 'GREEN';
+
+      case 'medium':
+        return 'YELLOW';
+
+      case 'high':
+        return 'RED - High';
+
+      case 'emergency':
+        return 'RED - Emergency';
+
+      default:
+        return value.toUpperCase();
+    }
+  }
+
+  Color severityColor(String value) {
+    switch (value) {
+      case 'low':
+        return HydroColors.green;
+
+      case 'medium':
+        return HydroColors.yellow;
+
+      case 'high':
+      case 'emergency':
+        return HydroColors.red;
+
+      default:
+        return HydroColors.muted;
+    }
+  }
+
+  // ============================================================
+  // COMPLAINT CARD
+  // ============================================================
+
+  Widget buildComplaintCard(
+    Map<String, dynamic> complaint,
+  ) {
+    final severity =
+        complaint['reported_severity']?.toString() ??
+            'unknown';
+
+    final status =
+        complaint['status']?.toString() ?? 'unknown';
+
+    final trackingId =
+        complaint['tracking_id']?.toString() ?? 'N/A';
+
+    final title =
+        complaint['title']?.toString() ?? 'Water Issue';
+
+    final address =
+        complaint['address_text']?.toString() ??
+            'Not provided';
+
+    final description =
+        complaint['description']?.toString() ?? '';
+
+    final assignedProfessionalId =
+        complaint['assigned_professional_id']
+            ?.toString();
+
+    final assignedProfessional =
+        assignedProfessionalId == null
+            ? null
+            : approvedProfessionals.where(
+                (professional) =>
+                    professional['user_id']
+                        ?.toString() ==
+                    assignedProfessionalId,
+              ).firstOrNull;
+
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 14),
+      child: HydroCard(
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                Icon(
+                  Icons.water_drop,
+                  color: severityColor(severity),
+                ),
+
+                const SizedBox(width: 10),
+
+                Expanded(
+                  child: Text(
+                    title,
+                    style: const TextStyle(
+                      fontWeight: FontWeight.bold,
+                      fontSize: 17,
+                      color: HydroColors.navy,
+                    ),
+                  ),
+                ),
+              ],
+            ),
+
+            const SizedBox(height: 12),
+
+            Text(
+              'Tracking ID: $trackingId',
+              style: const TextStyle(
+                fontWeight: FontWeight.w600,
+                color: HydroColors.teal,
+              ),
+            ),
+
+            const SizedBox(height: 8),
+
+            Text(
+              'Severity: ${severityLabel(severity)}',
+            ),
+
+            const SizedBox(height: 6),
+
+            Text('Status: $status'),
+
+            const SizedBox(height: 6),
+
+            Text('Location: $address'),
+
+            if (description.isNotEmpty) ...[
+              const SizedBox(height: 10),
+
+              Text(
+                description,
+                style: const TextStyle(
+                  color: HydroColors.muted,
+                ),
+              ),
+            ],
+
+            if (assignedProfessionalId != null) ...[
+              const SizedBox(height: 12),
+
+              Text(
+                'Assigned to: '
+                '${assignedProfessional?['partner_id'] ?? assignedProfessionalId}',
+                style: const TextStyle(
+                  fontWeight: FontWeight.w600,
+                  color: HydroColors.teal,
+                ),
+              ),
+            ],
+
+            if (status == 'submitted' ||
+                status == 'waiting_assignment') ...[
+              const SizedBox(height: 20),
+
+              SizedBox(
+                width: double.infinity,
+                child: FilledButton.icon(
+                  onPressed: assigningComplaintId != null
+                      ? null
+                      : () => showAssignProfessionalDialog(
+                            complaint,
+                          ),
+
+                  icon: const Icon(
+                    Icons.person_add_alt_1,
+                  ),
+
+                  label: const Text(
+                    'Assign Professional',
+                  ),
+                ),
+              ),
+            ],
+          ],
+        ),
+      ),
+    );
+  }
+
+  // ============================================================
+  // PROFESSIONAL APPROVAL CARD
+  // ============================================================
+
+  Widget buildProfessionalCard(
+    Map<String, dynamic> professional,
+  ) {
+    final professionalId =
+        professional['user_id']?.toString() ?? '';
+
+    final partnerId =
+        professional['partner_id']?.toString() ??
+            'N/A';
+
+    final specialization =
+        professional['specialization']?.toString() ??
+            'Unknown';
+
+    final serviceArea =
+        professional['service_area']?.toString() ??
+            'Not specified';
+
+    final experience =
+        professional['experience_years']?.toString() ??
+            'Not specified';
+
+    final bio =
+        professional['bio']?.toString() ?? '';
+
+    final isProcessing =
+        reviewingProfessionalId == professionalId;
+
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 14),
+      child: HydroCard(
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                Icon(
+                  specialization == 'electrician'
+                      ? Icons.electrical_services
+                      : Icons.plumbing,
+                  color: HydroColors.teal,
+                  size: 28,
+                ),
+
+                const SizedBox(width: 12),
+
+                Expanded(
+                  child: Text(
+                    specialization.toUpperCase(),
+                    style: const TextStyle(
+                      fontWeight: FontWeight.bold,
+                      fontSize: 18,
+                      color: HydroColors.navy,
+                    ),
+                  ),
+                ),
+              ],
+            ),
+
+            const SizedBox(height: 14),
+
+            Text(
+              'Partner ID: $partnerId',
+              style: const TextStyle(
+                color: HydroColors.teal,
+                fontWeight: FontWeight.w600,
+              ),
+            ),
+
+            const SizedBox(height: 8),
+
+            Text('Service Area: $serviceArea'),
+
+            const SizedBox(height: 8),
+
+            Text('Experience: $experience years'),
+
+            const SizedBox(height: 8),
+
+            const Text(
+              'Verification: PENDING',
+              style: TextStyle(
+                fontWeight: FontWeight.bold,
+                color: HydroColors.yellow,
+              ),
+            ),
+
+            if (bio.isNotEmpty) ...[
+              const SizedBox(height: 12),
+
+              Text(
+                bio,
+                style: const TextStyle(
+                  color: HydroColors.muted,
+                ),
+              ),
+            ],
+
+            const SizedBox(height: 20),
+
+            if (isProcessing)
+              const Center(
+                child: CircularProgressIndicator(),
+              )
+            else
+              Row(
+                children: [
+                  Expanded(
+                    child: FilledButton.icon(
+                      onPressed:
+                          isReviewingProfessional ||
+                                  professionalId.isEmpty
+                              ? null
+                              : () => reviewProfessional(
+                                    professionalId:
+                                        professionalId,
+                                    status: 'approved',
+                                  ),
+
+                      icon: const Icon(
+                        Icons.check_circle,
+                      ),
+
+                      label: const Text('Approve'),
+                    ),
+                  ),
+
+                  const SizedBox(width: 10),
+
+                  Expanded(
+                    child: OutlinedButton.icon(
+                      onPressed:
+                          isReviewingProfessional ||
+                                  professionalId.isEmpty
+                              ? null
+                              : () => reviewProfessional(
+                                    professionalId:
+                                        professionalId,
+                                    status: 'rejected',
+                                  ),
+
+                      icon: const Icon(
+                        Icons.cancel_outlined,
+                      ),
+
+                      label: const Text('Reject'),
+                    ),
+                  ),
+                ],
+              ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  // ============================================================
+  // MAIN DASHBOARD UI
+  // ============================================================
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text(
+          'BMC Officer Dashboard',
+        ),
+
+        actions: [
+          IconButton(
+            tooltip: 'Refresh dashboard',
+            onPressed: loading ||
+                    isReviewingProfessional ||
+                    assigningComplaintId != null
+                ? null
+                : loadDashboard,
+
+            icon: const Icon(Icons.refresh),
+          ),
+        ],
+      ),
+
+      body: SafeArea(
+        child: RefreshIndicator(
+          onRefresh: loadDashboard,
+
+          child: ListView(
+            physics:
+                const AlwaysScrollableScrollPhysics(),
+
+            padding: const EdgeInsets.all(24),
+
+            children: [
+              const Text(
+                'Water Issue Overview',
+                style: TextStyle(
+                  fontSize: 25,
+                  fontWeight: FontWeight.bold,
+                  color: HydroColors.navy,
+                ),
+              ),
+
+              const SizedBox(height: 10),
+
+              Text(
+                'Ward: $wardName',
+                style: const TextStyle(
+                  fontSize: 15,
+                  color: HydroColors.muted,
+                ),
+              ),
+
+              const SizedBox(height: 24),
+
+              // ============================================
+              // LOADING INDICATOR
+              // ============================================
+
+              if (loading)
+                const Center(
+                  child: Padding(
+                    padding: EdgeInsets.all(32),
+                    child: CircularProgressIndicator(),
+                  ),
+                )
+
+              // ============================================
+              // ERROR MESSAGE
+              // ============================================
+
+              else if (errorMessage != null)
+                HydroCard(
+                  child: Column(
+                    children: [
+                      const Icon(
+                        Icons.error_outline,
+                        color: HydroColors.red,
+                        size: 40,
+                      ),
+
+                      const SizedBox(height: 12),
+
+                      const Text(
+                        'Unable to load BMC dashboard',
+                        style: TextStyle(
+                          fontWeight: FontWeight.bold,
+                        ),
+                      ),
+
+                      const SizedBox(height: 10),
+
+                      Text(
+                        errorMessage!,
+                        textAlign: TextAlign.center,
+                      ),
+
+                      const SizedBox(height: 16),
+
+                      FilledButton(
+                        onPressed: loadDashboard,
+                        child: const Text('Retry'),
+                      ),
+                    ],
+                  ),
+                )
+
+              // ============================================
+              // DASHBOARD CONTENT
+              // ============================================
+
+              else ...[
+                // ==========================================
+                // CRITICAL ALERTS
+                // ==========================================
+
+                Container(
+                  padding: const EdgeInsets.all(18),
+
+                  decoration: BoxDecoration(
+                    color: redCount > 0
+                        ? const Color(0xFFFFE7E7)
+                        : HydroColors.aqua,
+
+                    borderRadius:
+                        BorderRadius.circular(16),
+                  ),
+
+                  child: Row(
+                    children: [
+                      Icon(
+                        redCount > 0
+                            ? Icons.warning_amber_rounded
+                            : Icons.check_circle_outline,
+
+                        color: redCount > 0
+                            ? HydroColors.red
+                            : HydroColors.teal,
+                      ),
+
+                      const SizedBox(width: 12),
+
+                      Expanded(
+                        child: Text(
+                          redCount > 0
+                              ? '$redCount critical issue(s) '
+                                  'require attention.'
+                              : 'No critical issues currently '
+                                  'reported.',
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+
+                const SizedBox(height: 24),
+
+                // ==========================================
+                // SEVERITY COUNTERS
+                // ==========================================
+
+                Row(
+                  children: [
+                    Expanded(
+                      child: _Metric(
+                        '$greenCount',
+                        'Green',
+                        Icons.water_drop_outlined,
+                      ),
+                    ),
+
+                    const SizedBox(width: 10),
+
+                    Expanded(
+                      child: _Metric(
+                        '$yellowCount',
+                        'Yellow',
+                        Icons.build_outlined,
+                      ),
+                    ),
+
+                    const SizedBox(width: 10),
+
+                    Expanded(
+                      child: _Metric(
+                        '$redCount',
+                        'Red',
+                        Icons.warning_amber,
+                      ),
+                    ),
+                  ],
+                ),
+
+                const SizedBox(height: 30),
+
+                // ==========================================
+                // AREA ISSUES
+                // ==========================================
+
+                const _SectionTitle(
+                  'Area Issues',
+                ),
+
+                const SizedBox(height: 12),
+
+                Text(
+                  '${complaints.length} complaint(s) '
+                  'in $wardName',
+                  style: const TextStyle(
+                    color: HydroColors.muted,
+                  ),
+                ),
+
+                const SizedBox(height: 16),
+
+                if (complaints.isEmpty)
+                  const HydroCard(
+                    child: Center(
+                      child: Padding(
+                        padding: EdgeInsets.all(20),
+                        child: Text(
+                          'No complaints found '
+                          'in your authorized ward.',
+                          textAlign: TextAlign.center,
+                        ),
+                      ),
+                    ),
+                  )
+                else
+                  ...complaints.map(
+                    buildComplaintCard,
+                  ),
+
+                const SizedBox(height: 30),
+
+                // ==========================================
+                // PENDING PROFESSIONAL APPROVALS
+                // ==========================================
+
+                const _SectionTitle(
+                  'Pending Professional Approvals',
+                ),
+
+                const SizedBox(height: 12),
+
+                Text(
+                  '${pendingProfessionals.length} '
+                  'professional(s) awaiting approval',
+                  style: const TextStyle(
+                    color: HydroColors.muted,
+                  ),
+                ),
+
+                const SizedBox(height: 16),
+
+                if (pendingProfessionals.isEmpty)
+                  const HydroCard(
+                    child: Center(
+                      child: Padding(
+                        padding: EdgeInsets.all(20),
+                        child: Text(
+                          'No pending professional '
+                          'applications in your '
+                          'authorized ward.',
+                          textAlign: TextAlign.center,
+                        ),
+                      ),
+                    ),
+                  )
+                else
+                  ...pendingProfessionals.map(
+                    buildProfessionalCard,
+                  ),
+
+                const SizedBox(height: 30),
+
+                // ==========================================
+                // APPROVED PROFESSIONALS
+                // ==========================================
+
+                const _SectionTitle(
+                  'Approved Professionals',
+                ),
+
+                const SizedBox(height: 12),
+
+                Text(
+                  '${approvedProfessionals.length} '
+                  'approved professional(s) in $wardName',
+                  style: const TextStyle(
+                    color: HydroColors.muted,
+                  ),
+                ),
+
+                const SizedBox(height: 16),
+
+                if (approvedProfessionals.isEmpty)
+                  const HydroCard(
+                    child: Padding(
+                      padding: EdgeInsets.all(20),
+                      child: Text(
+                        'No approved professionals '
+                        'found in this ward.',
+                        textAlign: TextAlign.center,
+                      ),
+                    ),
+                  )
+                else
+                  ...approvedProfessionals.map(
+                    (professional) {
+                      final specialization =
+                          professional['specialization']
+                                  ?.toString() ??
+                              'Unknown';
+
+                      final partnerId =
+                          professional['partner_id']
+                                  ?.toString() ??
+                              'N/A';
+
+                      final serviceArea =
+                          professional['service_area']
+                                  ?.toString() ??
+                              'Not specified';
+
+                      final availability =
+                          professional['availability']
+                                  ?.toString() ??
+                              'unknown';
+
+                      return Padding(
+                        padding: const EdgeInsets.only(
+                          bottom: 12,
+                        ),
+                        child: HydroCard(
+                          child: Column(
+                            crossAxisAlignment:
+                                CrossAxisAlignment.start,
+
+                            children: [
+                              Row(
+                                children: [
+                                  Icon(
+                                    specialization ==
+                                            'electrician'
+                                        ? Icons
+                                            .electrical_services
+                                        : Icons.plumbing,
+
+                                    color: HydroColors.teal,
+                                  ),
+
+                                  const SizedBox(
+                                    width: 10,
+                                  ),
+
+                                  Expanded(
+                                    child: Text(
+                                      specialization
+                                          .toUpperCase(),
+                                      style:
+                                          const TextStyle(
+                                        fontWeight:
+                                            FontWeight.bold,
+                                        fontSize: 17,
+                                        color:
+                                            HydroColors.navy,
+                                      ),
+                                    ),
+                                  ),
+                                ],
+                              ),
+
+                              const SizedBox(height: 10),
+
+                              Text(
+                                'Partner ID: $partnerId',
+                              ),
+
+                              const SizedBox(height: 6),
+
+                              Text(
+                                'Service Area: $serviceArea',
+                              ),
+
+                              const SizedBox(height: 6),
+
+                              Text(
+                                'Availability: $availability',
+                              ),
+
+                              const SizedBox(height: 6),
+
+                              const Text(
+                                'Verification: APPROVED',
+                                style: TextStyle(
+                                  color:
+                                      HydroColors.green,
+                                  fontWeight:
+                                      FontWeight.bold,
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                      );
+                    },
+                  ),
+              ],
+            ],
+          ),
+        ),
+      ),
+    );
+  }
 }

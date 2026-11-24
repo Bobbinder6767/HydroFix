@@ -49,11 +49,13 @@ class HydroWelcome extends StatelessWidget {
       padding: const EdgeInsets.all(28),
       child: Column(mainAxisAlignment: MainAxisAlignment.center, children: [
         const Spacer(),
-        Container(padding: const EdgeInsets.all(34),
-          decoration: const BoxDecoration(color: HydroColors.aqua, shape: BoxShape.circle),
-          child: const Icon(Icons.water_drop_rounded, color: HydroColors.teal, size: 96)),
+        Image.asset(
+          'assets/images/hydrofix_logo.png',  width: 230,  height: 230,
+          fit: BoxFit.contain,
+          
+        ),
         const SizedBox(height: 28),
-        const Text('HydroFix', style: TextStyle(fontSize: 38, fontWeight: FontWeight.w800, color: HydroColors.navy)),
+      
         const SizedBox(height: 12),
         const Text('Report. Resolve. Conserve.', style: TextStyle(fontSize: 17, color: HydroColors.muted)),
         const SizedBox(height: 24),
@@ -130,29 +132,148 @@ class _HydroSignInState extends State<HydroSignIn> {
   void dispose() { email.dispose(); password.dispose(); super.dispose(); }
 
   Future<void> submit() async {
-    if (!key.currentState!.validate()) return;
-    setState(() => busy = true);
-    try {
-      await Supabase.instance.client.auth.signInWithPassword(
-        email: email.text.trim(), password: password.text);
-      if (!mounted) return;
-      // Roles must be resolved from profiles / memberships, never a UI choice.
-      // Until that authorization is wired, only citizen navigation is enabled.
-      if (widget.role != HydroRole.citizen) {
-        await Supabase.instance.client.auth.signOut();
-        if (!mounted) return;
-        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content:
-          Text('Professional/BMC role verification is not connected yet.')));
-        return;
-      }
-      Navigator.of(context).pushAndRemoveUntil(MaterialPageRoute(
-        builder: (_) => const HydroShell()), (_) => false);
-    } on AuthException catch (e) {
-      if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(e.message)));
-    } catch (_) {
-      if (mounted) ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Unable to sign in. Try again.')));
-    } finally { if (mounted) setState(() => busy = false); }
+  if (!key.currentState!.validate()) return;
+
+  setState(() {
+    busy = true;
+  });
+
+  final supabase = Supabase.instance.client;
+
+  try {
+    // STEP 1: Authenticate using Supabase.
+    final response = await supabase.auth.signInWithPassword(
+      email: email.text.trim(),
+      password: password.text,
+    );
+
+    final user = response.user;
+
+    if (user == null) {
+      throw const AuthException('Authentication failed.');
+    }
+
+    // STEP 2: Retrieve the user's role.
+    final profile = await supabase
+        .from('profiles')
+        .select('id, role, is_active')
+        .eq('id', user.id)
+        .single();
+
+    final String userRole = profile['role'] as String;
+    final bool isActive = profile['is_active'] == true;
+
+    if (!isActive) {
+      throw const AuthException(
+        'Your account has been deactivated.',
+      );
+    }
+
+    // STEP 3: Select the correct dashboard.
+    Widget destination;
+
+    switch (widget.role) {
+      case HydroRole.citizen:
+        if (userRole != 'citizen') {
+          throw const AuthException(
+            'This account is not registered as a citizen.',
+          );
+        }
+
+        destination = const HydroShell();
+        break;
+
+      case HydroRole.professional:
+        if (userRole != 'professional') {
+          throw const AuthException(
+            'This account is not registered as a professional.',
+          );
+        }
+
+        // Check BMC verification status.
+        final professional = await supabase
+            .from('professional_profiles')
+            .select('verification_status')
+            .eq('user_id', user.id)
+            .single();
+
+        final String verificationStatus =
+            professional['verification_status'] as String;
+
+        if (verificationStatus != 'approved') {
+          throw AuthException(
+            verificationStatus == 'pending'
+                ? 'Your professional account is awaiting BMC approval.'
+                : 'Your professional account is not approved.',
+          );
+        }
+
+        destination = const ProfessionalDashboardPreview();
+        break;
+
+      case HydroRole.bmc:
+        if (userRole != 'bmc_admin') {
+          throw const AuthException(
+            'You do not have BMC administrator access.',
+          );
+        }
+
+        // Verify administrator profile.
+        final admin = await supabase
+            .from('admin_profiles')
+            .select('user_id, officer_id, ward_id')
+            .eq('user_id', user.id)
+            .maybeSingle();
+
+        if (admin == null) {
+          throw const AuthException(
+            'BMC administrator profile not found.',
+          );
+        }
+
+        destination = const BmcDashboardPreview();
+        break;
+    }
+
+    // STEP 4: Navigate to the authorized dashboard.
+    if (!mounted) return;
+
+    Navigator.of(context).pushAndRemoveUntil(
+      MaterialPageRoute(
+        builder: (_) => destination,
+      ),
+      (route) => false,
+    );
+  } on AuthException catch (error) {
+    await supabase.auth.signOut();
+
+    if (!mounted) return;
+
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(error.message),
+        backgroundColor: Colors.red,
+      ),
+    );
+  } catch (error) {
+    await supabase.auth.signOut();
+
+    if (!mounted) return;
+
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text('Login failed: $error'),
+        backgroundColor: Colors.red,
+      ),
+    );
+  } finally {
+    if (mounted) {
+      setState(() {
+        busy = false;
+      });
+    }
   }
+}
 
   @override
   Widget build(BuildContext context) {

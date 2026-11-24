@@ -2,10 +2,10 @@ import 'package:flutter_dotenv/flutter_dotenv.dart';
 
 class Env {
   static String get supabaseUrl {
-    return dotenv.env['https://krthhpxkmsqaevlzfwld.supabase.co/'] ?? '';
+    return dotenv.env['SUPABASE_URL'] ?? '';
   }
 
   static String get supabasePublishableKey {
-    return dotenv.env['sb_publishable_EDCTvgwY0idSHNonnArtng_GT-eG5nL'] ?? '';
+    return dotenv.env['SUPABASE_PUBLISHABLE_KEY'] ?? '';
   }
 }

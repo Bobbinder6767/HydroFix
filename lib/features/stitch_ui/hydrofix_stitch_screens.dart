@@ -1,10 +1,12 @@
 import 'dart:convert';
 import 'dart:io';
 
+// ignore: deprecated_member_use
 import 'package:flutter/material.dart';
 import 'package:image_picker/image_picker.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 import '../../core/theme/hydrofix_theme.dart';
+<<<<<<< HEAD
 
 // HydroFix displays three colors, but public.complaints.reported_severity
 // uses the PostgreSQL enum labels low, medium, high, emergency.
@@ -22,6 +24,8 @@ String severityToDatabase(String color) {
   }
 }
 
+=======
+>>>>>>> 090230e (Fix Supabase configuration and update login)
 // These UI screens use sample content where backend integration is pending.
 // The citizen sign-in form calls the existing Supabase Auth client.
 
@@ -172,6 +176,8 @@ class _HydroSignInState extends State<HydroSignIn> {
       email: email.text.trim(),
       password: password.text,
     );
+    debugPrint('HYDROFIX LOGIN: Supabase authentication successful');
+debugPrint('HYDROFIX LOGIN: User ID = ${response.user?.id}');
 
     final user = response.user;
 
@@ -185,6 +191,8 @@ class _HydroSignInState extends State<HydroSignIn> {
         .select('id, role, is_active')
         .eq('id', user.id)
         .single();
+    debugPrint('HYDROFIX LOGIN: Profile fetched = $profile');
+
 
     final String userRole = profile['role'] as String;
     final bool isActive = profile['is_active'] == true;
@@ -215,7 +223,7 @@ class _HydroSignInState extends State<HydroSignIn> {
             'This account is not registered as a professional.',
           );
         }
-
+        debugPrint('HYDROFIX LOGIN: Checking professional verification');
         // Check BMC verification status.
         final professional = await supabase
             .from('professional_profiles')

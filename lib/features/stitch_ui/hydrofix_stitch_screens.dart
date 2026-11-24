@@ -525,6 +525,10 @@ class _ReportScreenState extends State<ReportScreen> {
         'verify-severity',
         body: body,
       );
+      debugPrint('========== AI RESPONSE ==========');
+      debugPrint('Status: ${response.status}');
+      debugPrint('Data: ${response.data}');
+debugPrint('=================================');
       if (response.status != 200 || response.data is! Map) {
         throw Exception('AI verification unavailable (${response.status}).');
       }

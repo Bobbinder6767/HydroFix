@@ -6,8 +6,6 @@ import 'package:flutter/material.dart';
 import 'package:image_picker/image_picker.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 import '../../core/theme/hydrofix_theme.dart';
-<<<<<<< HEAD
-
 // HydroFix displays three colors, but public.complaints.reported_severity
 // uses the PostgreSQL enum labels low, medium, high, emergency.
 // Reserve 'high' for future use; critical public leaks require emergency.
@@ -24,8 +22,6 @@ String severityToDatabase(String color) {
   }
 }
 
-=======
->>>>>>> 090230e (Fix Supabase configuration and update login)
 // These UI screens use sample content where backend integration is pending.
 // The citizen sign-in form calls the existing Supabase Auth client.
 
@@ -340,9 +336,253 @@ debugPrint('HYDROFIX LOGIN: User ID = ${response.user?.id}');
           FilledButton(onPressed: busy ? null : submit,
             child: busy ? const SizedBox(height: 20, width: 20,
               child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white)) : const Text('Login')),
+              
+
+if (widget.role != HydroRole.bmc)
+  TextButton(
+    onPressed: () {
+      Navigator.push(
+        context,
+        MaterialPageRoute(
+          builder: (_) => HydroSignUp(role: widget.role),
+        ),
+      );
+    },
+    child: const Text('Create Account'),
+  ),
         ]),
       )),
     )));
+  }
+}
+
+class HydroSignUp extends StatefulWidget {
+  const HydroSignUp({super.key, required this.role});
+
+  final HydroRole role;
+
+  @override
+  State<HydroSignUp> createState() => _HydroSignUpState();
+}
+
+class _HydroSignUpState extends State<HydroSignUp> {
+  final formKey = GlobalKey<FormState>();
+  final fullName = TextEditingController();
+  final phone = TextEditingController();
+  final email = TextEditingController();
+  final password = TextEditingController();
+
+  String specialization = 'plumber';
+  bool busy = false;
+  bool hidden = true;
+
+  @override
+  void dispose() {
+    fullName.dispose();
+    phone.dispose();
+    email.dispose();
+    password.dispose();
+    super.dispose();
+  }
+
+  Future<void> register() async {
+    if (!formKey.currentState!.validate()) return;
+
+    setState(() => busy = true);
+
+    try {
+      final supabase = Supabase.instance.client;
+
+      final response = await supabase.auth.signUp(
+        email: email.text.trim(),
+        password: password.text,
+        data: {
+          'full_name': fullName.text.trim(),
+          'phone': phone.text.trim(),
+          'role': widget.role == HydroRole.citizen
+              ? 'citizen'
+              : 'professional',
+          if (widget.role == HydroRole.professional)
+            'specialization': specialization,
+        },
+      );
+
+      if (!mounted) return;
+
+      if (response.session == null) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text(
+              'Registration successful. Please verify your email before logging in.',
+            ),
+          ),
+        );
+        Navigator.pop(context);
+      } else {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(
+              widget.role == HydroRole.professional
+                  ? 'Registration successful. Await BMC approval.'
+                  : 'Registration successful. Please log in.',
+            ),
+          ),
+        );
+        await supabase.auth.signOut();
+        if (mounted) Navigator.pop(context);
+      }
+    } on AuthException catch (error) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text(error.message)),
+        );
+      }
+    } catch (error) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Registration failed: $error')),
+        );
+      }
+    } finally {
+      if (mounted) setState(() => busy = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final isProfessional = widget.role == HydroRole.professional;
+
+    return Scaffold(
+      appBar: AppBar(title: const Text('Create Account')),
+      body: SafeArea(
+        child: Center(
+          child: SingleChildScrollView(
+            padding: const EdgeInsets.all(24),
+            child: Form(
+              key: formKey,
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  Text(
+                    isProfessional
+                        ? 'Professional Registration'
+                        : 'Citizen Registration',
+                    textAlign: TextAlign.center,
+                    style: const TextStyle(
+                      fontSize: 25,
+                      fontWeight: FontWeight.bold,
+                      color: HydroColors.navy,
+                    ),
+                  ),
+                  const SizedBox(height: 28),
+
+                  TextFormField(
+                    controller: fullName,
+                    decoration: const InputDecoration(
+                      labelText: 'Full Name',
+                      prefixIcon: Icon(Icons.person_outline),
+                    ),
+                    validator: (value) =>
+                        value == null || value.trim().isEmpty
+                            ? 'Enter your full name'
+                            : null,
+                  ),
+                  const SizedBox(height: 16),
+
+                  TextFormField(
+                    controller: phone,
+                    keyboardType: TextInputType.phone,
+                    decoration: const InputDecoration(
+                      labelText: 'Phone Number',
+                      prefixIcon: Icon(Icons.phone_outlined),
+                    ),
+                    validator: (value) =>
+                        value == null ||
+                                !RegExp(r'^[0-9]{10}$')
+                                    .hasMatch(value.trim())
+                            ? 'Enter a valid 10-digit phone number'
+                            : null,
+                  ),
+                  const SizedBox(height: 16),
+
+                  TextFormField(
+                    controller: email,
+                    keyboardType: TextInputType.emailAddress,
+                    decoration: const InputDecoration(
+                      labelText: 'Email',
+                      prefixIcon: Icon(Icons.mail_outline),
+                    ),
+                    validator: (value) =>
+                        value == null || !value.contains('@')
+                            ? 'Enter a valid email'
+                            : null,
+                  ),
+                  const SizedBox(height: 16),
+
+                  if (isProfessional) ...[
+                    DropdownButtonFormField<String>(
+                      value: specialization,
+                      decoration: const InputDecoration(
+                        labelText: 'Specialization',
+                        prefixIcon: Icon(Icons.build_outlined),
+                      ),
+                      items: const [
+                        DropdownMenuItem(
+                          value: 'plumber',
+                          child: Text('Plumber'),
+                        ),
+                        DropdownMenuItem(
+                          value: 'electrician',
+                          child: Text('Electrician'),
+                        ),
+                      ],
+                      onChanged: (value) {
+                        if (value != null) {
+                          setState(() => specialization = value);
+                        }
+                      },
+                    ),
+                    const SizedBox(height: 16),
+                  ],
+
+                  TextFormField(
+                    controller: password,
+                    obscureText: hidden,
+                    decoration: InputDecoration(
+                      labelText: 'Password',
+                      prefixIcon: const Icon(Icons.lock_outline),
+                      suffixIcon: IconButton(
+                        onPressed: () =>
+                            setState(() => hidden = !hidden),
+                        icon: Icon(
+                          hidden
+                              ? Icons.visibility_outlined
+                              : Icons.visibility_off_outlined,
+                        ),
+                      ),
+                    ),
+                    validator: (value) =>
+                        value == null || value.length < 6
+                            ? 'Password must contain at least 6 characters'
+                            : null,
+                  ),
+                  const SizedBox(height: 24),
+
+                  FilledButton(
+                    onPressed: busy ? null : register,
+                    child: busy
+                        ? const CircularProgressIndicator(
+                            color: Colors.white,
+                          )
+                        : const Text('Register'),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
   }
 }
 
